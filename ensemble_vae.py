@@ -459,7 +459,7 @@ if __name__ == "__main__":
         decoder_fun = lambda x: model.decoder(x).mean
         
 
-        geodesics = tuple(map(lambda pair: compute_geodesic_ensemble(pair[0], pair[1],decoder_fun), chosen_pairs))
+        geodesics = tuple(map(lambda pair: compute_geodesic(pair[0], pair[1],decoder_fun), chosen_pairs))
 
         
         for i, curve in enumerate(geodesics):

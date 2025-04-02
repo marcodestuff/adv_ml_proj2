@@ -15,8 +15,9 @@ from copy import deepcopy
 import os
 import math
 import matplotlib.pyplot as plt
+from tqdm import trange
 
-from geodesics import compute_geodesic
+from geodesics import compute_geodesic, curve
 from utils import get_all_labels_and_latents
 
 class GaussianPrior(nn.Module):
@@ -157,6 +158,68 @@ class VAE(nn.Module):
         return -self.elbo(x)
 
 
+def energy(weights, decoders, c0, c1, N, num_models):
+    """
+    Computes the energy approximation of the curve for multiple models using Monte Carlo estimation.
+    (eq. 8.7 in the book)
+    """
+    t = torch.linspace(0, 1, N + 1)
+    c_points = curve(t, c0, c1, weights)
+
+    total_energy = 0.0
+    
+    # Looping over all decoders and computing the energy for each model
+    for i in range(num_models):
+        decoder_fun = decoders[i]
+        f_vals = decoder_fun(c_points).mean
+        diffs = f_vals[1:] - f_vals[:-1]
+        total_energy += (diffs ** 2).sum()
+    
+    # Averaging the energy over all models (Monte Carlo estimation)
+    return total_energy / num_models
+
+def compute_geodesic_ensemble(c0, c1, decoders, num_models, polyn_order=4, latent_dim=2, N=100, num_iterations=2500, lr=1e-3, debug=False):
+    """
+    Computes an approximate geodesic between two latent points using energy minimization via Adam.
+    Includes optional early stopping, and Monte Carlo estimation of the energy for multiple models.
+    """
+    weights = torch.randn(latent_dim, polyn_order - 1, requires_grad=True)
+    
+    if debug:
+        print(f'Init Energy for {weights}: {energy(weights, decoders, c0, c1, N, num_models).item()}')
+    
+    optimizer = torch.optim.Adam([weights], lr)
+    
+    best_energy = float('inf')
+    steps_since_improvement = 0
+
+    for i in trange(num_iterations, desc="Optimizing geodesic"):
+        optimizer.zero_grad()
+        E = energy(weights, decoders, c0, c1, N, num_models)
+        E.backward()
+        optimizer.step()
+
+        current_energy = E.item()
+
+        if best_energy - current_energy > 1e-4:
+            best_energy = current_energy
+            steps_since_improvement = 0
+        else:
+            steps_since_improvement += 1
+
+        if steps_since_improvement >= 200:
+            if debug:
+                print(f"Early stopping at iteration {i}, Energy: {current_energy}")
+            break
+        
+        if i % 100 == 0 and debug:
+            print(f"Iteration {i}, Energy: {current_energy}")
+    
+    if debug:
+        print(f"Final weights: {weights}. Final Energy: {energy(weights, decoders, c0, c1, N, num_models).item()}")
+    
+    return curve(torch.linspace(0, 1, N + 1), c0, c1, weights)
+
 def train(model, optimizer, data_loader, epochs, device):
     """
     Train a VAE model.
@@ -221,7 +284,7 @@ if __name__ == "__main__":
         "mode",
         type=str,
         default="train",
-        choices=["train", "sample", "eval", "geodesics"],
+        choices=["train", "sample", "eval", "geodesics", "ensemble_geodesics", "cov_analysis"],
         help="what to do when running the script (default: %(default)s)",
     )
     parser.add_argument(
@@ -465,4 +528,133 @@ if __name__ == "__main__":
         plt.scatter(all_latents[:, 0].cpu(), all_latents[:, 1].cpu(), c=all_labels.cpu(), cmap='winter', alpha=0.3)
 
         plt.title('Latent Space')
+        plt.show()
+
+    elif args.mode == "ensemble_geodesics":
+        experiment_folder = args.experiment_folder
+        model_range = range(0,2)
+        num_curves = args.num_curves
+        decoders = []
+        for i in model_range:
+            model = VAE(
+                GaussianPrior(M), 
+                GaussianDecoder(new_decoder()),
+                GaussianEncoder(new_encoder())
+            ).to(device)
+            model.load_state_dict(torch.load(f"{experiment_folder}/model{i}.pt", weights_only=True))
+            model.eval()
+            
+            decoder_fun = lambda x: model.decoder(x)
+            decoders.append(decoder_fun)
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+        with torch.no_grad():
+            x, y = next(iter(mnist_test_loader))
+            x = x.to(device)
+            latent = model.encoder(x).rsample()
+        
+        # Randomly selecting pairs of latent points
+        indices = torch.randperm(latent.size(0))[:(2 * num_curves)]
+        chosen_pairs = list(zip(latent[indices[:num_curves]], latent[indices[num_curves:]]))
+        
+        # Computing geodesics for the chosen pairs
+        geodesics = tuple(map(lambda pair: compute_geodesic_ensemble(pair[0], pair[1], decoders, len(decoders)), chosen_pairs))
+
+        for i, curve in enumerate(geodesics):
+            if curve is not None:
+                plt.plot(curve[:, 0].detach().numpy(), curve[:, 1].detach().numpy(), linestyle='-', linewidth=1, label=str(i), color='black')
+        
+        all_latents, all_labels = get_all_labels_and_latents(model, mnist_test_loader)
+        plt.scatter(all_latents[:, 0].cpu(), all_latents[:, 1].cpu(), c=all_labels.cpu(), cmap='winter', alpha=0.3)
+
+        plt.title('Latent Space and Geodesics')
+        plt.show()
+
+    elif args.mode == "cov_analysis":
+        import numpy as np
+        import pandas as pd
+
+        from euclidean import euclidean_distance 
+
+        model = VAE(
+            GaussianPrior(M),
+            GaussianDecoder(new_decoder()),
+            GaussianEncoder(new_encoder())
+        ).to(device)
+        model.load_state_dict(torch.load(f"{args.experiment_folder}/model0.pt", map_location=device))
+        model.eval()
+
+        def compute_distance_stats(c0, c1, decoder_modules):
+            euclidean_dists = []
+            geodesic_dists = []
+
+            for decoder in decoder_modules:
+                z0 = decoder(c0.unsqueeze(0)).mean.squeeze()  # [1, M] -> [28,28]
+                z1 = decoder(c1.unsqueeze(0)).mean.squeeze()
+                euclidean_dists.append(euclidean_distance(z0, z1).item())
+
+            # Geodesic is computed across ensemble
+            path = compute_geodesic_ensemble(c0, c1, decoder_modules, len(decoder_modules), N=50)
+            diff = path[1:] - path[:-1]
+            geodesic_dists.append(diff.norm(dim=1).sum().item())
+
+            return euclidean_dists, geodesic_dists
+
+        def compute_cov(values):
+            mean = np.mean(values)
+            std = np.std(values)
+            return std / mean if mean != 0 else 0
+
+        num_pairs = 10
+        test_pairs = []
+
+        with torch.no_grad():
+            x, _ = next(iter(mnist_test_loader))
+            x = x.to(device)
+            latents = model.encoder(x).rsample()
+            indices = torch.randperm(latents.size(0))[:2 * num_pairs]
+            test_pairs = list(zip(latents[indices[:num_pairs]], latents[indices[num_pairs:]]))
+
+        results = []
+
+        for num_dec in [1, 2, 3]:
+            model_paths = [f"{args.experiment_folder}/model{i}.pt" for i in range((num_dec - 1) * 10, num_dec * 10)]
+            decoder_fns = []
+            for path in model_paths:
+                model = VAE(
+                    GaussianPrior(M),
+                    GaussianDecoder(new_decoder()),
+                    GaussianEncoder(new_encoder())
+                ).to(device)
+                model.load_state_dict(torch.load(path, map_location=device))
+                model.eval()
+                decoder_fns.append(model.decoder)
+
+            cov_e_list = []
+            cov_g_list = []
+
+            for c0, c1 in tqdm(test_pairs, desc=f"CoV: {num_dec} decoders"):
+                eucl_dists, geo_dists = compute_distance_stats(c0, c1, decoder_fns)
+                cov_e_list.append(compute_cov(eucl_dists))
+                cov_g_list.append(compute_cov(geo_dists))
+
+            results.append({
+                "num_decoders": num_dec,
+                "cov_euclidean": np.mean(cov_e_list),
+                "cov_geodesic": np.mean(cov_g_list),
+            })
+
+        df = pd.DataFrame(results)
+        print(df)
+
+        # Plotting
+        plt.plot(df["num_decoders"], df["cov_euclidean"], label="Euclidean", marker='o')
+        plt.plot(df["num_decoders"], df["cov_geodesic"], label="Geodesic", marker='s')
+        plt.xlabel("Number of Ensemble Decoders")
+        plt.ylabel("Average Coefficient of Variation (CoV)")
+        plt.title("CoV of Euclidean vs Geodesic Distance")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig("cov_plot.png")
         plt.show()
